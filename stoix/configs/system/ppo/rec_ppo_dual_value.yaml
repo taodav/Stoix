@@ -1,0 +1,26 @@
+# --- Defaults REC-PPO with an auxiliary non-recurrent value head ---
+# Identical to rec_ppo, but trains an additional non-recurrent value function
+# alongside the recurrent critic (same architecture, hidden state zeroed every
+# step, own independent GAE bootstrap). The extra head never affects the policy;
+# it exists only to compare recurrent vs. non-recurrent "value drift".
+
+system_name: rec_ppo_dual_value # Name of the system.
+
+# --- RL hyperparameters ---
+actor_lr: 1e-4 # Learning rate for actor network
+critic_lr: 1e-4 # Learning rate for critic network (also used for the non-recurrent value head)
+rollout_length: 128 # Number of environment steps per vectorised environment.
+epochs: 10 # Number of ppo epochs per training data batch.
+num_minibatches: 32 # Number of minibatches per ppo epoch.
+gamma: 0.99 # Discounting factor.
+gae_lambda: 0.95 # Lambda value for GAE computation.
+clip_eps: 0.2 # Clipping value for PPO updates and value function.
+ent_coef: 0.0 # Entropy regularisation term for loss function.
+vf_coef: 0.5 # Critic weight in
+max_grad_norm: 0.5 # Maximum norm of the gradients for a weight update.
+decay_learning_rates: True # Whether learning rates should be linearly decayed during training.
+standardize_advantages: True # Whether to standardize the advantages.
+
+# --- Recurrent hyperparameters ---
+recurrent_chunk_size: ~ # The size of the chunks in which the recurrent sequences are divided during the training process.
+# If unspecified, the rollout length is used as the chunk size which means that the recurrent sequences are not divided.

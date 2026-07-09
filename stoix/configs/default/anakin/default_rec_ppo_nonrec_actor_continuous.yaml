@@ -1,0 +1,11 @@
+defaults:
+  - logger: logger
+  - arch: anakin
+  - system: ppo/rec_ppo_nonrec_actor_continuous
+  - network: rnn_continuous
+  - env: brax/halfcheetah
+  - _self_
+
+hydra:
+  searchpath:
+    - file://stoix/configs

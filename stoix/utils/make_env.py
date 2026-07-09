@@ -304,6 +304,34 @@ def make_debug_env(scenario_name: str, config: DictConfig) -> Tuple[Environment,
     return env, eval_env
 
 
+def make_differentiable_env(
+    scenario_name: str, config: DictConfig
+) -> Tuple[Environment, Environment]:
+    """Creates a differentiable environment for analytic policy gradient methods.
+
+    These environments have no jax.lax.stop_gradient calls and use continuous
+    action spaces, enabling backpropagation through the dynamics.
+    """
+    from stoix.wrappers.differentiable_acrobot import DifferentiableAcrobot
+
+    DIFFERENTIABLE_ENVS = {
+        "acrobot": DifferentiableAcrobot,
+    }
+
+    if scenario_name not in DIFFERENTIABLE_ENVS:
+        raise ValueError(
+            f"Unknown differentiable environment '{scenario_name}'. "
+            f"Available: {list(DIFFERENTIABLE_ENVS.keys())}"
+        )
+
+    env_kwargs = dict(config.env.kwargs) if config.env.kwargs else {}
+    env = DIFFERENTIABLE_ENVS[scenario_name](**env_kwargs)
+    eval_env = DIFFERENTIABLE_ENVS[scenario_name](**env_kwargs)
+    env, eval_env = apply_optional_wrappers((env, eval_env), config)
+    env = apply_core_wrappers(env, config)
+    return env, eval_env
+
+
 def make_jaxarc_env(scenario_name: str, config: DictConfig) -> Tuple[Environment, Environment]:
     """Creates and wraps a JaxARC environment for ARC puzzle tasks.
 
@@ -430,6 +458,7 @@ ENV_MAKERS = {
     "kinetix": make_kinetix_env,
     "mujoco_playground": make_playground_env,
     "debug": make_debug_env,
+    "differentiable": make_differentiable_env,
 }
 
 
