@@ -13,6 +13,10 @@
 # and never affects the policy. This lets us compare recurrent vs. non-recurrent
 # "value drift" between two checkpoints.
 #
+# Uses ACTION CONCATENATION (env=gymnax/cartpole_action_concat): the previous
+# action (one-hot, zero at t=0) is appended to each observation. The recurrent
+# actor and critic see it; the memory-free critic strips it to stay Markov.
+#
 # NOTE on minibatches: with only 4 envs the recurrent batch has 4 sequences, so
 # num_minibatches must divide 4. We use 1 (full-batch); valid options are 1, 2, 4.
 
@@ -21,7 +25,7 @@ set -euo pipefail
 PYTHON="${PYTHON:-.venv/bin/python}"
 
 "${PYTHON}" stoix/systems/ppo/anakin/rec_ppo_dual_value.py \
-  env=gymnax/cartpole \
+  env=gymnax/cartpole_action_concat \
   network=rnn \
   network.actor_network.rnn_layer.hidden_state_dim=32 \
   network.critic_network.rnn_layer.hidden_state_dim=32 \
@@ -31,10 +35,11 @@ PYTHON="${PYTHON:-.venv/bin/python}"
   arch.num_evaluation=50 \
   system.num_minibatches=1 \
   logger.checkpointing.save_model=True \
+  logger.checkpointing.save_args.checkpoint_uid=cartpole_dual_value_ac_h32 \
   logger.checkpointing.save_args.save_interval_steps=1 \
   logger.checkpointing.save_args.max_to_keep=50 \
   "$@"
 
-# Checkpoints are written to:  ./checkpoints/rec_ppo_dual_value/<timestamp>/<step>/
+# Checkpoints: ./checkpoints/rec_ppo_dual_value/cartpole_dual_value_ac_h32/<step>/
 # Each checkpoint's learner_state.params contains: actor_params, critic_params
 # (recurrent value), and nr_critic_params (non-recurrent value).

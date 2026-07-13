@@ -1,0 +1,11 @@
+defaults:
+  - logger: logger
+  - arch: anakin
+  - system: ppo/rec_ppo_nonrec_actor_mftarget
+  - network: rnn
+  - env: gymnax/acrobot
+  - _self_
+
+hydra:
+  searchpath:
+    - file://stoix/configs

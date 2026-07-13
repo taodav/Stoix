@@ -21,6 +21,11 @@
 # and `num_minibatches` must divide (num_envs * num_recurrent_chunks) = 4.
 # The rec_ppo default of 32 would crash here, so we set it to 1 (full-batch).
 # Valid alternatives with 4 envs are 1, 2, or 4.
+#
+# Uses ACTION CONCATENATION (env=gymnax/cartpole_action_concat): the previous
+# action (one-hot, zero at t=0) is appended to each observation. Both the
+# recurrent actor and recurrent critic are trajectory-processing networks, so
+# both see it (no stripping needed here -- this base system has no Markov head).
 
 set -euo pipefail
 
@@ -28,7 +33,7 @@ set -euo pipefail
 PYTHON="${PYTHON:-.venv/bin/python}"
 
 "${PYTHON}" stoix/systems/ppo/anakin/rec_ppo.py \
-  env=gymnax/cartpole \
+  env=gymnax/cartpole_action_concat \
   network=rnn \
   network.actor_network.rnn_layer.hidden_state_dim=32 \
   network.critic_network.rnn_layer.hidden_state_dim=32 \

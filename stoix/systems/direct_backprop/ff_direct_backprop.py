@@ -4,6 +4,21 @@ This algorithm directly backpropagates the sum of discounted rewards through
 the (differentiable) environment dynamics into the policy parameters, yielding
 exact policy gradients rather than estimates (as in REINFORCE/PPO).
 
+Base algorithm (Madeka et al., "Deep Inventory Management", arXiv:2210.03137):
+    L(theta) = - sum_{t=0}^{H-1} gamma^t * r_t,   with a_t = pi_theta(s_t),
+                                                        s_{t+1} = f(s_t, a_t).
+    There is NO critic and NO value function — the sum of rewards, differentiated
+    through the known dynamics, IS the policy gradient. This is the default.
+
+Optional terminal-value bootstrap (SHAC-style extension, OFF by default):
+    Because each update only differentiates through `rollout_length` steps of a
+    longer episode, the gradient is myopic to rewards beyond the horizon. Setting
+    `system.use_terminal_value=True` adds a learned critic V(s_H) as a
+    differentiable terminal value, so the actor gradient also accounts for the
+    return tail:  L(theta) = -( sum gamma^t r_t + gamma^H V(s_H) ).
+    This is NOT part of base Direct Backprop — it is the SHAC extension. When the
+    flag is False, no critic is built, traced, or trained at all.
+
 Requirements:
     - The environment must be fully differentiable (no stop_gradient, continuous
       actions). Use env_name=differentiable with the DifferentiableAcrobot.
@@ -11,12 +26,12 @@ Requirements:
 Key differences from PPO:
     - No trajectory buffer, GAE, advantages, minibatches, or epochs.
     - env.step is called INSIDE jax.grad (the rollout IS the loss computation).
-    - A critic provides an optional terminal value bootstrap at the horizon end.
     - Exploration via Gaussian noise (reparameterization trick).
 
-Reference:
+References:
     Madeka et al., "Deep Inventory Management", arXiv:2210.03137 (2022).
-    Also related to SHAC, APG (analytic policy gradients).
+    Xu et al., "Accelerated Policy Learning with Parallel Differentiable
+    Simulation" (SHAC), ICLR 2022 — the optional terminal-value critic.
 """
 
 import copy
@@ -89,7 +104,7 @@ def get_learner_fn(
 
         def _differentiable_rollout_loss(
             actor_params: FrozenDict,
-            critic_params: FrozenDict,
+            critic_params: Any,
             env_state: Any,
             observation: chex.Array,
             key: chex.PRNGKey,
@@ -98,6 +113,11 @@ def get_learner_fn(
 
             This function is the computational graph that jax.grad differentiates through.
             env.step is called INSIDE this function, so gradients flow through dynamics.
+
+            Base Direct Backprop uses only the sum of rewards. If
+            `use_terminal_value` is set, a critic V(s_H) is added as a
+            differentiable terminal value (SHAC-style); otherwise critic_params
+            is None and no critic is involved.
 
             Note: observation has shape (num_envs, obs_dim) because the env is vmapped.
             All per-env quantities (discount, reward) also have shape (num_envs,).
@@ -154,16 +174,14 @@ def get_learner_fn(
             # Sum of discounted rewards: sum over time, mean over envs
             total_return = jnp.sum(rewards, axis=0)  # (num_envs,)
 
-            # Optional: terminal value bootstrap from critic
+            # Optional (SHAC-style) terminal value bootstrap from critic.
+            # Base Direct Backprop skips this entirely (critic_params is None).
             if config.system.use_terminal_value:
                 # final_obs shape: (num_envs, obs_dim)
                 terminal_value = critic_apply_fn(critic_params, final_obs)
                 # terminal_value shape: (num_envs,)
                 terminal_value = terminal_value * final_discount
-            else:
-                terminal_value = jnp.zeros(num_envs)
-
-            total_return = total_return + terminal_value  # (num_envs,)
+                total_return = total_return + terminal_value  # (num_envs,)
 
             # Average over environments, negate for loss
             loss = -jnp.mean(total_return)
@@ -195,34 +213,44 @@ def get_learner_fn(
         )
         actor_new_params = optax.apply_updates(params.actor_params, actor_updates)
 
-        # ---- Update critic (supervised, not through dynamics) ----
-        def _critic_loss_fn(critic_params: FrozenDict) -> Tuple[chex.Array, dict]:
-            """MSE loss between critic prediction and observed mean return."""
-            # last_timestep.observation shape: (num_envs, obs_dim)
-            predicted_values = critic_apply_fn(
-                critic_params, last_timestep.observation
-            )  # (num_envs,)
-            # Target is the observed (stopped) mean total return (scalar)
-            target = jax.lax.stop_gradient(total_return)
-            value_loss = jnp.mean(0.5 * (predicted_values - target) ** 2)
-            return value_loss, {
-                "value_loss": value_loss,
-                "pred_value": jnp.mean(predicted_values),
-            }
+        # ---- Optional critic update (only for the SHAC-style terminal value) ----
+        # The critic is trained by regression onto the observed return. It is not
+        # differentiated through the dynamics. When use_terminal_value is False,
+        # there is no critic at all — this is pure Direct Backprop.
+        if config.system.use_terminal_value:
 
-        critic_grad_fn = jax.grad(_critic_loss_fn, has_aux=True)
-        critic_grads, critic_loss_info = critic_grad_fn(params.critic_params)
-        critic_grads, critic_loss_info = jax.lax.pmean(
-            (critic_grads, critic_loss_info), axis_name="batch"
-        )
-        critic_grads, critic_loss_info = jax.lax.pmean(
-            (critic_grads, critic_loss_info), axis_name="device"
-        )
+            def _critic_loss_fn(critic_params: FrozenDict) -> Tuple[chex.Array, dict]:
+                """MSE loss between critic prediction and observed mean return."""
+                # last_timestep.observation shape: (num_envs, obs_dim)
+                predicted_values = critic_apply_fn(
+                    critic_params, last_timestep.observation
+                )  # (num_envs,)
+                # Target is the observed (stopped) mean total return (scalar)
+                target = jax.lax.stop_gradient(total_return)
+                value_loss = jnp.mean(0.5 * (predicted_values - target) ** 2)
+                return value_loss, {
+                    "value_loss": value_loss,
+                    "pred_value": jnp.mean(predicted_values),
+                }
 
-        critic_updates, critic_new_opt_state = critic_update_fn(
-            critic_grads, opt_states.critic_opt_state
-        )
-        critic_new_params = optax.apply_updates(params.critic_params, critic_updates)
+            critic_grad_fn = jax.grad(_critic_loss_fn, has_aux=True)
+            critic_grads, critic_loss_info = critic_grad_fn(params.critic_params)
+            critic_grads, critic_loss_info = jax.lax.pmean(
+                (critic_grads, critic_loss_info), axis_name="batch"
+            )
+            critic_grads, critic_loss_info = jax.lax.pmean(
+                (critic_grads, critic_loss_info), axis_name="device"
+            )
+
+            critic_updates, critic_new_opt_state = critic_update_fn(
+                critic_grads, opt_states.critic_opt_state
+            )
+            critic_new_params = optax.apply_updates(params.critic_params, critic_updates)
+        else:
+            # Pure Direct Backprop: no critic.
+            critic_new_params = None
+            critic_new_opt_state = None
+            critic_loss_info = {}
 
         # ---- Pack new params and state ----
         new_params = ActorCriticParams(actor_new_params, critic_new_params)
@@ -319,22 +347,11 @@ def learner_setup(
     actor_action_head = CompositeNetwork([actor_action_head, action_head_post_processor])
     actor_network = Actor(torso=actor_torso, action_head=actor_action_head)
 
-    # Define critic network.
-    critic_torso = hydra.utils.instantiate(config.network.critic_network.pre_torso)
-    critic_head = hydra.utils.instantiate(config.network.critic_network.critic_head)
-    critic_network = Critic(torso=critic_torso, critic_head=critic_head)
-
     # Optimizers (no epochs/minibatches in Direct Backprop, so pass 1).
     actor_lr = make_learning_rate(config.system.actor_lr, config, num_epochs=1)
-    critic_lr = make_learning_rate(config.system.critic_lr, config, num_epochs=1)
-
     actor_optim = optax.chain(
         optax.clip_by_global_norm(config.system.max_grad_norm),
         optax.adam(actor_lr, eps=1e-5),
-    )
-    critic_optim = optax.chain(
-        optax.clip_by_global_norm(config.system.max_grad_norm),
-        optax.adam(critic_lr, eps=1e-5),
     )
 
     # Initialise observation for network init.
@@ -345,19 +362,35 @@ def learner_setup(
     actor_params = actor_network.init(actor_net_key, init_x)
     actor_opt_state = actor_optim.init(actor_params)
 
-    # Initialise critic params and optimiser state.
-    critic_params = critic_network.init(critic_net_key, init_x)
-    critic_opt_state = critic_optim.init(critic_params)
+    # Critic is only built for the optional SHAC-style terminal value.
+    # Pure Direct Backprop (use_terminal_value=False) has no critic at all.
+    if config.system.use_terminal_value:
+        critic_torso = hydra.utils.instantiate(config.network.critic_network.pre_torso)
+        critic_head = hydra.utils.instantiate(config.network.critic_network.critic_head)
+        critic_network = Critic(torso=critic_torso, critic_head=critic_head)
+        critic_lr = make_learning_rate(config.system.critic_lr, config, num_epochs=1)
+        critic_optim = optax.chain(
+            optax.clip_by_global_norm(config.system.max_grad_norm),
+            optax.adam(critic_lr, eps=1e-5),
+        )
+        critic_params = critic_network.init(critic_net_key, init_x)
+        critic_opt_state = critic_optim.init(critic_params)
+        critic_network_apply_fn = critic_network.apply
+        critic_update = critic_optim.update
+    else:
+        critic_params = None
+        critic_opt_state = None
+        critic_network_apply_fn = None
+        critic_update = None
 
     # Pack params.
     params = ActorCriticParams(actor_params, critic_params)
 
     actor_network_apply_fn = actor_network.apply
-    critic_network_apply_fn = critic_network.apply
 
     # Pack apply and update functions.
     apply_fns = (actor_network_apply_fn, critic_network_apply_fn)
-    update_fns = (actor_optim.update, critic_optim.update)
+    update_fns = (actor_optim.update, critic_update)
 
     # Get batched iterated update and replicate it to pmap it over cores.
     learn = get_learner_fn(env, apply_fns, update_fns, config)

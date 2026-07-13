@@ -1,0 +1,36 @@
+# --- Non-recurrent actor + recurrent critic trained on MEMORY-FREE targets ---
+# Same as rec_ppo_nonrec_actor (reactive/Markov actor, recurrent value head), but
+# the recurrent critic is regressed toward the GAE targets of the MEMORY-FREE
+# value head (nr_targets) instead of its own history-conditioned bootstrap. This
+# severs the self-reinforcing bootstrap loop and isolates whether that loop is
+# what drives the recurrent critic's spurious history-use on a Markov task.
+#
+# The non-recurrent head (nr_critic) is still trained normally and provides the
+# history-free targets; the policy still uses the recurrent critic's advantages.
+
+system_name: rec_ppo_nonrec_actor_mftarget # Name of the system.
+
+# --- RL hyperparameters ---
+actor_lr: 1e-4 # Learning rate for actor network
+critic_lr: 1e-4 # Learning rate for critic network (also used for the non-recurrent value head)
+rollout_length: 128 # Number of environment steps per vectorised environment.
+epochs: 10 # Number of ppo epochs per training data batch.
+num_minibatches: 32 # Number of minibatches per ppo epoch.
+gamma: 0.99 # Discounting factor.
+gae_lambda: 0.95 # Lambda value for GAE computation.
+clip_eps: 0.2 # Clipping value for PPO updates and value function.
+ent_coef: 0.0 # Entropy regularisation term for loss function.
+vf_coef: 0.5 # Critic weight in
+max_grad_norm: 0.5 # Maximum norm of the gradients for a weight update.
+decay_learning_rates: True # Whether learning rates should be linearly decayed during training.
+standardize_advantages: True # Whether to standardize the advantages.
+
+# --- Recurrent hyperparameters ---
+recurrent_chunk_size: ~ # The size of the chunks in which the recurrent sequences are divided during the training process.
+
+# If True, the critic's hidden state is zeroed at EVERY step, turning the value
+# function Markov (value = function of the current observation only). This gives
+# the Markov-value baseline (Exp 1); False (default) keeps the recurrent critic
+# with Markov targets (Exp 2). The reactive actor and Markov targets are unchanged
+# either way, so this single knob isolates recurrent-vs-Markov value.
+reset_critic_hidden_state_every_step: False

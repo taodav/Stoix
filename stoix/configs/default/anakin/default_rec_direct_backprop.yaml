@@ -1,0 +1,11 @@
+defaults:
+  - logger: logger
+  - arch: anakin
+  - system: direct_backprop/rec_direct_backprop
+  - network: rnn_direct_backprop
+  - env: differentiable/acrobot
+  - _self_
+
+hydra:
+  searchpath:
+    - file://stoix/configs

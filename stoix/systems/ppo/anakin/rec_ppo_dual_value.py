@@ -90,6 +90,21 @@ class RNNDualValueTransition(NamedTuple):
     info: Dict
 
 
+def strip_action_features(observation: chex.Array, action_feature_dim: int) -> chex.Array:
+    """Drop the trailing previous-action features from an observation.
+
+    The ActionConcatWrapper appends the previous action to every observation so
+    the RECURRENT actor and critic (which process trajectories) can accumulate an
+    action history. The memory-free critic must stay Markov -- it represents value
+    as a function of the current state, so it must NOT see the previous action.
+    This removes the last ``action_feature_dim`` features. A dim of 0 (no wrapper)
+    is a no-op.
+    """
+    if action_feature_dim <= 0:
+        return observation
+    return observation[..., :-action_feature_dim]
+
+
 def get_learner_fn(
     env: Environment,
     apply_fns: Tuple[RecActorApply, RecCriticApply, RecCriticApply],
@@ -145,16 +160,20 @@ def get_learner_fn(
                 lambda x: x[jnp.newaxis, :], last_timestep.observation
             )
             reset_hidden_state = jnp.logical_or(last_done, last_truncated)
+            # Recurrent actor & critic see the FULL (possibly action-augmented) obs.
             ac_in = (
                 batched_observation,
                 reset_hidden_state[jnp.newaxis, :],
             )
 
             # For the non-recurrent value head we zero out the hidden state at every
-            # step by always signalling a reset. This makes its output a pure function
-            # of the current observation while keeping an identical architecture.
+            # step by always signalling a reset, AND strip the previous-action
+            # features, so its output is a pure function of the current state.
+            batched_observation_markov = strip_action_features(
+                batched_observation, config.system.action_feature_dim
+            )
             nr_ac_in = (
-                batched_observation,
+                batched_observation_markov,
                 jnp.ones_like(reset_hidden_state[jnp.newaxis, :]),
             )
 
@@ -244,7 +263,7 @@ def get_learner_fn(
             reset_hidden_state[jnp.newaxis, :],
         )
         nr_ac_in = (
-            batched_last_observation,
+            strip_action_features(batched_last_observation, config.system.action_feature_dim),
             jnp.ones_like(reset_hidden_state[jnp.newaxis, :]),
         )
 
@@ -367,11 +386,15 @@ def get_learner_fn(
                     hidden state is zeroed at every step (reset flag always True), so the
                     value is a pure function of the current observation.
                     """
-                    # RERUN NETWORK with the hidden state reset at every step.
+                    # RERUN NETWORK with the hidden state reset at every step and
+                    # the Markov obs (previous-action features stripped).
                     reset_hidden_state = jnp.ones_like(
                         jnp.logical_or(traj_batch.done, traj_batch.truncated)
                     )
-                    obs_and_done = (traj_batch.obs, reset_hidden_state)
+                    obs_markov = strip_action_features(
+                        traj_batch.obs, config.system.action_feature_dim
+                    )
+                    obs_and_done = (obs_markov, reset_hidden_state)
                     nr_critic_hidden_state = jax.tree_util.tree_map(
                         lambda x: x[0], traj_batch.hstates.nr_critic_hidden_state
                     )
@@ -602,6 +625,12 @@ def learner_setup(
     num_actions = int(env.action_space().num_values)
     config.system.action_dim = num_actions
 
+    # If the env appends the previous action (ActionConcatWrapper), the recurrent
+    # actor and critic see the full augmented observation; the memory-free critic
+    # has these trailing features stripped so it stays Markov.
+    action_feature_dim = int(getattr(env, "action_feature_dim", 0))
+    config.system.action_feature_dim = action_feature_dim
+
     # PRNG keys.
     key, actor_net_key, critic_net_key, nr_critic_net_key = keys
 
@@ -678,7 +707,11 @@ def learner_setup(
     )
     init_obs = jax.tree_util.tree_map(lambda x: x[None, ...], init_obs)
     init_done = jnp.zeros((1, config.arch.num_envs), dtype=bool)
+    # Full (possibly action-augmented) obs for the recurrent actor & critic; Markov
+    # obs (previous-action features stripped) for the memory-free critic. Identical
+    # when no ActionConcatWrapper is used.
     init_x = (init_obs, init_done)
+    init_x_markov = (strip_action_features(init_obs, action_feature_dim), init_done)
 
     # Initialise hidden states.
     init_policy_hstate = actor_rnn.initialize_carry(config.arch.num_envs)
@@ -690,7 +723,9 @@ def learner_setup(
     actor_opt_state = actor_optim.init(actor_params)
     critic_params = critic_network.init(critic_net_key, init_critic_hstate, init_x)
     critic_opt_state = critic_optim.init(critic_params)
-    nr_critic_params = nr_critic_network.init(nr_critic_net_key, init_nr_critic_hstate, init_x)
+    nr_critic_params = nr_critic_network.init(
+        nr_critic_net_key, init_nr_critic_hstate, init_x_markov
+    )
     nr_critic_opt_state = nr_critic_optim.init(nr_critic_params)
 
     actor_network_apply_fn = actor_network.apply

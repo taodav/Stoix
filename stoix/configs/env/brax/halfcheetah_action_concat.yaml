@@ -1,0 +1,22 @@
+# ---HalfCheetah with previous-action concatenation (for recurrent runs)---
+# Same as brax/halfcheetah, but the previous action (raw continuous vector, zero
+# at t=0) is appended to each observation via ActionConcatWrapper, so the
+# recurrent value / policy can condition on the action history.
+
+env_name: brax
+
+scenario:
+  name : halfcheetah
+  task_name: halfcheetah
+
+kwargs: {
+  backend: spring
+}
+
+eval_metric: episode_return
+
+use_cached_auto_reset: true
+
+# Append the previous action to the observation.
+wrapper:
+  _target_: stoix.wrappers.action_concat.ActionConcatWrapper

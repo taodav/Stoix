@@ -153,6 +153,16 @@ def load_config(run_uid: str, overrides: Tuple[str, ...] = (), model_name: str =
                 f"at {env_cfg_path}. Pass the env explicitly via --overrides env=<group>."
             )
         auto_overrides.append(f"env={env_group}")
+        # Re-attach any optional env wrapper the run was trained with (e.g. the
+        # ActionConcatWrapper). The env config group is named by task_name and does
+        # not encode the wrapper, so restore it explicitly from metadata; otherwise
+        # the analysis rebuilds an UNWRAPPED env and the observation dims won't match
+        # the trained networks.
+        wrapper_target = meta_env.get("wrapper", {})
+        wrapper_target = wrapper_target.get("_target_") if isinstance(wrapper_target, dict) else None
+        if wrapper_target:
+            # '+' appends the key: the base env config has no 'wrapper' entry.
+            auto_overrides.append(f"+env.wrapper._target_={wrapper_target}")
 
     for role in ("actor_network", "critic_network"):
         rnn = meta_net.get(role, {}).get("rnn_layer", {})
@@ -358,7 +368,14 @@ def sample_prefix_trajectories(
                 if _actor_nonrecurrent
                 else done.reshape(1, 1)
             )
-            ac_in = (batched_obs, actor_done)
+            # A reactive (non-recurrent) actor is Markov and never sees the appended
+            # previous action; a recurrent actor (dual_value) sees the full obs.
+            actor_obs = (
+                strip_action_features(batched_obs, _action_feature_dim)
+                if _actor_nonrecurrent
+                else batched_obs
+            )
+            ac_in = (actor_obs, actor_done)
             new_hstate, pi = actor_apply(params_u.actor_params, hstate, ac_in)
             # Network output has leading (time=1, batch=1) dims. Drop them; the env
             # wants a scalar (discrete) or an (action_dim,) vector (continuous).
@@ -427,9 +444,11 @@ def replay_policy_hstate(
         obs_in = obs_s[:, jnp.newaxis, :]        # (L, 1, obs_dim)
         # For a non-recurrent actor, the hidden state is always zeroed — the
         # "hidden state at S" is just the zero carry regardless of history. We
-        # still run the scan (to keep shapes consistent) but with all-True resets.
+        # still run the scan (to keep shapes consistent) but with all-True resets,
+        # and strip the appended previous action (the reactive actor never sees it).
         if _actor_nonrecurrent:
             done_in = jnp.ones((obs_s.shape[0], 1), dtype=bool)
+            obs_in = strip_action_features(obs_in, _action_feature_dim)
         else:
             done_in = done_s[:, jnp.newaxis]     # (L, 1)
         init_h = ScannedRNN(
@@ -489,6 +508,8 @@ def compute_nonrecurrent_value_at_S(
     """
 
     def value_one(obs):
+        # The memory-free critic is always Markov: strip the appended prev action.
+        obs = strip_action_features(obs, _action_feature_dim)
         obs_in = obs[jnp.newaxis, jnp.newaxis, :]  # (1, 1, obs_dim)
         done_in = jnp.ones((1, 1), dtype=bool)     # reset -> zero hidden state
         init_h = ScannedRNN(
@@ -547,7 +568,13 @@ def monte_carlo_value(
             if _actor_nonrecurrent
             else jnp.zeros((1, 1), dtype=bool)
         )
-        new_hstate, pi = actor_apply(actor_params, hstate, (batched_obs, done_flag))
+        # Reactive actor is Markov and never sees the appended previous action.
+        actor_obs = (
+            strip_action_features(batched_obs, _action_feature_dim)
+            if _actor_nonrecurrent
+            else batched_obs
+        )
+        new_hstate, pi = actor_apply(actor_params, hstate, (actor_obs, done_flag))
         # Drop leading (time=1, batch=1) dims; scalar (discrete) or vector (cont.).
         action = pi.sample(seed=act_key)[0, 0]
         new_env_state, ts = env.step(env_state, action)
@@ -611,6 +638,18 @@ _actor_cell_type: str = "gru"
 # step) during trajectory sampling and Monte-Carlo rollouts. Auto-set from the
 # checkpoint metadata's system_name.
 _actor_nonrecurrent: bool = False
+# Number of trailing observation features that are the appended previous action
+# (ActionConcatWrapper). The RECURRENT critic sees the full obs; the memory-free
+# critic always strips these; the actor strips them iff it is non-recurrent.
+# Auto-set from the env in precompute/score. 0 => no wrapper (all strips are no-ops).
+_action_feature_dim: int = 0
+
+
+def strip_action_features(observation: chex.Array, action_feature_dim: int) -> chex.Array:
+    """Drop the trailing previous-action features from an observation (no-op if 0)."""
+    if action_feature_dim <= 0:
+        return observation
+    return observation[..., :-action_feature_dim]
 
 
 # --------------------------------------------------------------------------- #
@@ -638,7 +677,7 @@ def precompute_ground_truth(args: argparse.Namespace) -> Dict[str, Any]:
     heads' inputs), and the MC values+variances are saved to a .npz so the cheap
     scoring phase -- and any re-analysis -- never re-pays the rollout cost.
     """
-    global _critic_hidden_dim, _critic_cell_type, _actor_hidden_dim, _actor_cell_type, _actor_nonrecurrent
+    global _critic_hidden_dim, _critic_cell_type, _actor_hidden_dim, _actor_cell_type, _actor_nonrecurrent, _action_feature_dim
 
     cfg = load_config(args.run_uid, overrides=tuple(args.overrides or ()), model_name=args.model_name)
     cfg.num_devices = 1
@@ -669,6 +708,10 @@ def precompute_ground_truth(args: argparse.Namespace) -> Dict[str, Any]:
     _actor_nonrecurrent = "nonrec_actor" in system_name
     if _actor_nonrecurrent:
         print("Detected non-recurrent actor (policy is reactive/Markov).")
+    # How many trailing obs features are the appended previous action (0 if none).
+    _action_feature_dim = int(getattr(eval_env, "action_feature_dim", 0))
+    if _action_feature_dim:
+        print(f"Detected ActionConcatWrapper: {_action_feature_dim} appended action features.")
 
     if args.gamma is not None:
         cfg.system.gamma = args.gamma
@@ -776,7 +819,7 @@ def score_from_ground_truth(args: argparse.Namespace, gt: Dict[str, Any]) -> Dic
     estimate of E[(V_hat - V_true)^2] -- which is what lets us trust results
     from a modest number of rollouts.
     """
-    global _critic_hidden_dim, _critic_cell_type, _actor_hidden_dim, _actor_cell_type, _actor_nonrecurrent
+    global _critic_hidden_dim, _critic_cell_type, _actor_hidden_dim, _actor_cell_type, _actor_nonrecurrent, _action_feature_dim
 
     cfg = load_config(args.run_uid, overrides=tuple(args.overrides or ()), model_name=args.model_name)
     cfg.num_devices = 1
@@ -798,6 +841,7 @@ def score_from_ground_truth(args: argparse.Namespace, gt: Dict[str, Any]) -> Dic
     meta = read_checkpoint_metadata(args.run_uid, model_name=args.model_name)
     system_name = meta.get("system", {}).get("system_name", "")
     _actor_nonrecurrent = "nonrec_actor" in system_name
+    _action_feature_dim = int(getattr(eval_env, "action_feature_dim", 0))
 
     dummy_params = init_dummy_params(cfg, actor, critic, nr_critic)
     ckpt_uprime = int(gt["ckpt_uprime"])

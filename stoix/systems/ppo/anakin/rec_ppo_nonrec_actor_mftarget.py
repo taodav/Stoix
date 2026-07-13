@@ -165,11 +165,19 @@ def get_learner_fn(
             batched_observation_markov = strip_action_features(
                 batched_observation, config.system.action_feature_dim
             )
-            # The recurrent CRITIC uses the real reset logic (carries memory) and
-            # sees the FULL observation, including the appended previous action.
+            # The CRITIC normally uses the real reset logic (carries memory) and
+            # sees the FULL observation. If reset_critic_hidden_state_every_step is
+            # set, its hidden state is zeroed every step too -> a MARKOV value
+            # function (the Exp-1 baseline). One knob isolates recurrent-vs-Markov
+            # value, holding the reactive actor and Markov targets fixed.
+            critic_reset = (
+                jnp.ones_like(reset_hidden_state)
+                if config.system.reset_critic_hidden_state_every_step
+                else reset_hidden_state
+            )
             critic_ac_in = (
                 batched_observation,
-                reset_hidden_state[jnp.newaxis, :],
+                critic_reset[jnp.newaxis, :],
             )
 
             # The ACTOR is made non-recurrent by always zeroing its hidden state
@@ -271,9 +279,15 @@ def get_learner_fn(
             batched_last_observation, config.system.action_feature_dim
         )
         # Recurrent critic bootstrap: full obs. Memory-free critic: stripped obs.
+        # Zero the critic hidden state too if running the Markov-value baseline.
+        critic_reset = (
+            jnp.ones_like(reset_hidden_state)
+            if config.system.reset_critic_hidden_state_every_step
+            else reset_hidden_state
+        )
         ac_in = (
             batched_last_observation,
-            reset_hidden_state[jnp.newaxis, :],
+            critic_reset[jnp.newaxis, :],
         )
         nr_ac_in = (
             batched_last_observation_markov,
@@ -375,8 +389,11 @@ def get_learner_fn(
                     targets: chex.Array,
                 ) -> Tuple:
                     """Calculate the critic loss."""
-                    # RERUN NETWORK
+                    # RERUN NETWORK. Zero the critic hidden state every step for the
+                    # Markov-value baseline; else use the real episode-boundary resets.
                     reset_hidden_state = jnp.logical_or(traj_batch.done, traj_batch.truncated)
+                    if config.system.reset_critic_hidden_state_every_step:
+                        reset_hidden_state = jnp.ones_like(reset_hidden_state)
                     obs_and_done = (traj_batch.obs, reset_hidden_state)
                     critic_hidden_state = jax.tree_util.tree_map(
                         lambda x: x[0], traj_batch.hstates.critic_hidden_state
@@ -439,9 +456,18 @@ def get_learner_fn(
                 )
 
                 # CALCULATE CRITIC LOSS
+                # --- Memory-free-target intervention ---
+                # The recurrent critic is regressed toward `nr_targets` (the GAE
+                # targets bootstrapped from the MEMORY-FREE nr_critic head) instead
+                # of `targets` (bootstrapped from its own history-conditioned
+                # values). This severs the self-reinforcing bootstrap loop while
+                # leaving the recurrent critic architecturally identical, isolating
+                # whether that loop is what drives spurious history-use. The policy
+                # still uses `advantages` (recurrent GAE), so learning is otherwise
+                # unchanged.
                 critic_grad_fn = jax.grad(_critic_loss_fn, has_aux=True)
                 critic_grads, critic_loss_info = critic_grad_fn(
-                    params.critic_params, traj_batch, targets
+                    params.critic_params, traj_batch, nr_targets
                 )
 
                 # CALCULATE NON-RECURRENT CRITIC LOSS
@@ -1000,7 +1026,7 @@ def run_experiment(_config: DictConfig) -> float:
 
 @hydra.main(
     config_path="../../../configs/default/anakin",
-    config_name="default_rec_ppo_nonrec_actor.yaml",
+    config_name="default_rec_ppo_nonrec_actor_mftarget.yaml",
     version_base="1.2",
 )
 def hydra_entry_point(cfg: DictConfig) -> float:
@@ -1012,7 +1038,7 @@ def hydra_entry_point(cfg: DictConfig) -> float:
     eval_performance = run_experiment(cfg)
 
     print(
-        f"{Fore.CYAN}{Style.BRIGHT}Non-recurrent actor + dual-value experiment completed"
+        f"{Fore.CYAN}{Style.BRIGHT}Non-recurrent actor + memory-free-target critic experiment completed"
         f"{Style.RESET_ALL}"
     )
     return eval_performance

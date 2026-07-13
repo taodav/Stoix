@@ -1,0 +1,18 @@
+# ---Acrobot with previous-action concatenation (for recurrent runs)---
+# Same as gymnax/acrobot, but the previous action (one-hot, zero at t=0) is
+# appended to each observation via ActionConcatWrapper, so the recurrent value
+# / policy can condition on the action history.
+
+env_name: gymnax
+
+scenario:
+  name: Acrobot-v1
+  task_name: acrobot
+
+kwargs: {}
+
+eval_metric: episode_return
+
+# Append the previous action to the observation.
+wrapper:
+  _target_: stoix.wrappers.action_concat.ActionConcatWrapper

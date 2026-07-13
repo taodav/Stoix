@@ -162,9 +162,11 @@ def policy_kl_under_histories(
 
     def dist_at_S(prefix_obs, o_final):
         seq = jnp.concatenate([prefix_obs, o_final[jnp.newaxis, :]], axis=0)
-        # Match training: non-recurrent actor always resets; recurrent carries memory.
+        # Match training: non-recurrent actor always resets and never sees the
+        # appended previous action; recurrent actor carries memory and sees full obs.
         if m._actor_nonrecurrent:
             done_full = jnp.ones((seq.shape[0], 1), dtype=bool)
+            seq = m.strip_action_features(seq, m._action_feature_dim)
         else:
             done_full = jnp.zeros((seq.shape[0], 1), dtype=bool)
         obs_in = seq[:, jnp.newaxis, :]
@@ -295,6 +297,11 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     m._actor_nonrecurrent = "nonrec_actor" in system_name
     if m._actor_nonrecurrent:
         print("Detected non-recurrent actor (policy is reactive/Markov).")
+    # Appended previous-action features (ActionConcatWrapper). The recurrent critic
+    # sees the full obs; the Markov actor / memory-free critic strip these.
+    m._action_feature_dim = int(getattr(eval_env, "action_feature_dim", 0))
+    if m._action_feature_dim:
+        print(f"Detected ActionConcatWrapper: {m._action_feature_dim} appended action features.")
 
     actor, critic, nr_critic, actor_rnn = m.build_networks(
         cfg, num_actions, is_continuous, a_min, a_max

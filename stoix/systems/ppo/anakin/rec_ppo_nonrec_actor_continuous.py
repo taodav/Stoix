@@ -90,6 +90,21 @@ class RNNDualValueTransition(NamedTuple):
     info: Dict
 
 
+def strip_action_features(observation: chex.Array, action_feature_dim: int) -> chex.Array:
+    """Drop the trailing previous-action features from an observation.
+
+    The ActionConcatWrapper appends the previous action to every observation so
+    the RECURRENT critic (which processes trajectories) can accumulate an action
+    history. Networks that must stay Markov -- the reactive actor and the
+    memory-free critic -- must NOT see the previous action, since it is history,
+    not current state. This removes the last ``action_feature_dim`` features.
+    A dim of 0 (no wrapper) is a no-op.
+    """
+    if action_feature_dim <= 0:
+        return observation
+    return observation[..., :-action_feature_dim]
+
+
 def get_learner_fn(
     env: Environment,
     apply_fns: Tuple[RecActorApply, RecCriticApply, RecCriticApply],
@@ -145,23 +160,28 @@ def get_learner_fn(
                 lambda x: x[jnp.newaxis, :], last_timestep.observation
             )
             reset_hidden_state = jnp.logical_or(last_done, last_truncated)
-            # The recurrent CRITIC uses the real reset logic (carries memory).
+            # Markov observation (previous-action features stripped) for the
+            # networks that must not see action history.
+            batched_observation_markov = strip_action_features(
+                batched_observation, config.system.action_feature_dim
+            )
+            # The recurrent CRITIC uses the real reset logic (carries memory) and
+            # sees the FULL observation, including the appended previous action.
             critic_ac_in = (
                 batched_observation,
                 reset_hidden_state[jnp.newaxis, :],
             )
 
             # The ACTOR is made non-recurrent by always zeroing its hidden state
-            # (reset flag = True every step). Its output is a pure function of the
-            # current observation, so the policy pi is reactive / Markov.
+            # (reset flag = True every step) and sees the Markov obs (action stripped).
             actor_ac_in = (
-                batched_observation,
+                batched_observation_markov,
                 jnp.ones_like(reset_hidden_state[jnp.newaxis, :]),
             )
 
-            # For the non-recurrent value head we also zero its hidden state.
+            # The memory-free value head is also Markov: stripped obs, zeroed hidden.
             nr_ac_in = (
-                batched_observation,
+                batched_observation_markov,
                 jnp.ones_like(reset_hidden_state[jnp.newaxis, :]),
             )
 
@@ -246,12 +266,13 @@ def get_learner_fn(
             lambda x: x[jnp.newaxis, :], last_timestep.observation
         )
         reset_hidden_state = jnp.logical_or(last_done, last_truncated)
+        # Recurrent critic bootstrap: full obs. Memory-free critic: stripped obs.
         ac_in = (
             batched_last_observation,
             reset_hidden_state[jnp.newaxis, :],
         )
         nr_ac_in = (
-            batched_last_observation,
+            strip_action_features(batched_last_observation, config.system.action_feature_dim),
             jnp.ones_like(reset_hidden_state[jnp.newaxis, :]),
         )
 
@@ -316,11 +337,15 @@ def get_learner_fn(
                     rng_key: chex.PRNGKey,
                 ) -> Tuple:
                     """Calculate the actor loss."""
-                    # RERUN NETWORK — actor is non-recurrent: always reset hidden state.
+                    # RERUN NETWORK — actor is non-recurrent: always reset hidden
+                    # state, and use the Markov obs (previous-action features stripped).
                     actor_reset = jnp.ones_like(
                         jnp.logical_or(traj_batch.done, traj_batch.truncated)
                     )
-                    obs_and_done = (traj_batch.obs, actor_reset)
+                    obs_markov = strip_action_features(
+                        traj_batch.obs, config.system.action_feature_dim
+                    )
+                    obs_and_done = (obs_markov, actor_reset)
                     policy_hidden_state = jax.tree_util.tree_map(
                         lambda x: x[0], traj_batch.hstates.policy_hidden_state
                     )
@@ -379,11 +404,15 @@ def get_learner_fn(
                     hidden state is zeroed at every step (reset flag always True), so the
                     value is a pure function of the current observation.
                     """
-                    # RERUN NETWORK with the hidden state reset at every step.
+                    # RERUN NETWORK with the hidden state reset at every step and
+                    # the Markov obs (previous-action features stripped).
                     reset_hidden_state = jnp.ones_like(
                         jnp.logical_or(traj_batch.done, traj_batch.truncated)
                     )
-                    obs_and_done = (traj_batch.obs, reset_hidden_state)
+                    obs_markov = strip_action_features(
+                        traj_batch.obs, config.system.action_feature_dim
+                    )
+                    obs_and_done = (obs_markov, reset_hidden_state)
                     nr_critic_hidden_state = jax.tree_util.tree_map(
                         lambda x: x[0], traj_batch.hstates.nr_critic_hidden_state
                     )
@@ -618,6 +647,12 @@ def learner_setup(
     config.system.action_minimum = float(env.action_space().minimum)
     config.system.action_maximum = float(env.action_space().maximum)
 
+    # If the env appends the previous action (ActionConcatWrapper), the recurrent
+    # critic sees the full augmented observation; the reactive actor and the
+    # memory-free critic have these trailing features stripped so they stay Markov.
+    action_feature_dim = int(getattr(env, "action_feature_dim", 0))
+    config.system.action_feature_dim = action_feature_dim
+
     # PRNG keys.
     key, actor_net_key, critic_net_key, nr_critic_net_key = keys
 
@@ -697,7 +732,11 @@ def learner_setup(
     )
     init_obs = jax.tree_util.tree_map(lambda x: x[None, ...], init_obs)
     init_done = jnp.zeros((1, config.arch.num_envs), dtype=bool)
+    # Full (possibly action-augmented) obs for the recurrent critic; Markov obs
+    # (previous-action features stripped) for the reactive actor and memory-free
+    # critic. Identical when no ActionConcatWrapper is used.
     init_x = (init_obs, init_done)
+    init_x_markov = (strip_action_features(init_obs, action_feature_dim), init_done)
 
     # Initialise hidden states.
     init_policy_hstate = actor_rnn.initialize_carry(config.arch.num_envs)
@@ -705,11 +744,13 @@ def learner_setup(
     init_nr_critic_hstate = critic_rnn.initialize_carry(config.arch.num_envs)
 
     # initialise params and optimiser state.
-    actor_params = actor_network.init(actor_net_key, init_policy_hstate, init_x)
+    actor_params = actor_network.init(actor_net_key, init_policy_hstate, init_x_markov)
     actor_opt_state = actor_optim.init(actor_params)
     critic_params = critic_network.init(critic_net_key, init_critic_hstate, init_x)
     critic_opt_state = critic_optim.init(critic_params)
-    nr_critic_params = nr_critic_network.init(nr_critic_net_key, init_nr_critic_hstate, init_x)
+    nr_critic_params = nr_critic_network.init(
+        nr_critic_net_key, init_nr_critic_hstate, init_x_markov
+    )
     nr_critic_opt_state = nr_critic_optim.init(nr_critic_params)
 
     actor_network_apply_fn = actor_network.apply
@@ -827,11 +868,21 @@ def run_experiment(_config: DictConfig) -> float:
         env, (key, actor_net_key, critic_net_key, nr_critic_net_key), config
     )
 
-    # Setup evaluator.
+    # Setup evaluator. The shared evaluator feeds the FULL env observation to the
+    # actor, but the reactive actor was built on the Markov (action-stripped) obs.
+    # Wrap the actor apply to strip the previous-action features first, so eval
+    # matches training. A no-op when action_feature_dim == 0.
+    eval_action_feature_dim = int(config.system.get("action_feature_dim", 0))
+
+    def eval_actor_apply(params: FrozenDict, hstate: chex.Array, obs_and_done: Tuple) -> Tuple:
+        observation, done = obs_and_done
+        observation = strip_action_features(observation, eval_action_feature_dim)
+        return actor_network.apply(params, hstate, (observation, done))
+
     evaluator, absolute_metric_evaluator, (trained_params, eval_keys) = evaluator_setup(
         eval_env=eval_env,
         key_e=key_e,
-        eval_act_fn=get_rec_distribution_act_fn(config, actor_network.apply),
+        eval_act_fn=get_rec_distribution_act_fn(config, eval_actor_apply),
         params=learner_state.params.actor_params,
         config=config,
         use_recurrent_net=True,

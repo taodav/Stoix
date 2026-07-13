@@ -1,0 +1,21 @@
+# ---Differentiable Acrobot with previous-action concatenation (for recurrent DB)---
+# Same as differentiable/acrobot, but the previous action (raw continuous scalar,
+# zero at t=0) is appended to each observation via ActionConcatWrapper. Used by the
+# RECURRENT Direct Backprop actor so it can accumulate an action history. The
+# memory-free actor variant strips these features (see rec_direct_backprop.py).
+
+env_name: differentiable
+
+scenario:
+  name: acrobot
+  task_name: differentiable_acrobot
+
+kwargs:
+  max_steps_in_episode: 200
+  dt: 0.2
+
+eval_metric: episode_return
+
+# Append the previous action to the observation.
+wrapper:
+  _target_: stoix.wrappers.action_concat.ActionConcatWrapper

@@ -3,12 +3,18 @@ system_name: ff_direct_backprop
 
 # --- RL Hyperparameters ---
 actor_lr: 1e-4
-critic_lr: 3e-4
 rollout_length: 32
 gamma: 0.99
 max_grad_norm: 1.0
 decay_learning_rates: False
 exploration_noise: 0.1
-use_terminal_value: True
 reward_scale: 1.0
 normalize_observations: False
+
+# --- Optional SHAC-style terminal value bootstrap (NOT base Direct Backprop) ---
+# False -> pure Direct Backprop: loss is just the sum of rewards backpropagated
+#          through the dynamics. No critic is built or trained.
+# True  -> add a learned critic V(s_H) as a differentiable terminal value to
+#          account for the return beyond the truncated rollout horizon.
+use_terminal_value: False
+critic_lr: 3e-4
